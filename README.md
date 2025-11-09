@@ -4,6 +4,7 @@ Tiny CUDA/cuBLAS/NCCL micro-bench suite for fast GPU node/cluster acceptance. No
 ## Why you may need it
 You run one container, get three numbers (TFLOP/s, GB/s memory, GB/s NCCL), and immediately know if the node is suitable for ML.
 
+**Resulting image size:** 2.71GB
 
 ## Repository layout
 - **src/gpu_accept_cuda_so.py** — main script. Loads `libcudart`, `libcublas`, `libnccl` via ctypes and runs:

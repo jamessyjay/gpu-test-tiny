@@ -14,17 +14,17 @@ ENV NV_CUDA_CUDART_VERSION=13.0.96-1
 ARG TARGETARCH
 FROM base-${TARGETARCH}
 
-
 LABEL maintainer="Dimitry Leden <dimitry.leden@gmail.com>"
 
-ARG OS_VERSION="ubuntu2404"
-ARG PACKAGE_NAME="3bf863cc"
-ARG BASE_URL="https://developer.download.nvidia.com/compute/cuda/repos"
+# Args for CUDA repo (can be overriden in the runtime with --build-arg or .env file)
+ENV OS_VERSION=${OS_VERSION:-"ubuntu2404"}
+ENV PACKAGE_NAME=${PACKAGE_NAME:-"3bf863cc"}
+ENV BASE_URL=${BASE_URL:-"https://developer.download.nvidia.com/compute/cuda/repos"}
 
-# CUDA repo
+# CUDA repo (keyring + signed-by for apt and ubuntu2404 + compatibility)
 RUN apt-get update && apt-get install -y --no-install-recommends gnupg2 curl ca-certificates && \
-    curl -fsSL ${BASE_URL}/${OS_VERSION}/${NVARCH}/${PACKAGE_NAME}.pub | apt-key add - && \
-    echo "deb ${BASE_URL}/${OS_VERSION}/${NVARCH} /" > /etc/apt/sources.list.d/cuda.list && \
+    curl -fsSL ${BASE_URL}/${OS_VERSION}/${NVARCH}/${PACKAGE_NAME}.pub | gpg --dearmor -o /usr/share/keyrings/cuda-archive-keyring.gpg && \
+    echo "deb [arch=${NVARCH} signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] ${BASE_URL}/${OS_VERSION}/${NVARCH} /" > /etc/apt/sources.list.d/cuda.list && \
     apt-get purge --autoremove -y curl && rm -rf /var/lib/apt/lists/*
 
 ENV CUDA_VERSION=13.0.2
@@ -39,6 +39,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Add CUDA lib path to ld.so.conf.d
 RUN echo "/usr/local/cuda/lib64" >> /etc/ld.so.conf.d/nvidia.conf
+RUN ldconfig
 
 # Set environment variables
 ENV PATH=/usr/local/nvidia/bin:/usr/local/cuda/bin:${PATH}
@@ -53,6 +54,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     NCCL_DEBUG=INFO \
     PATH=/opt/venv/bin:$PATH
 
+# tini: tiny but valid init for containers -> https://github.com/krallin/tini
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-venv python3-pip ca-certificates tini \
  && rm -rf /var/lib/apt/lists/*
@@ -71,5 +73,9 @@ WORKDIR /app
 COPY src/ ./src/
 ENV PYTHONPATH=/app/src
 
+# Args for test script (can be overriden in the runtime with --build-arg or .env file)
+ENV TEST_SCRIPT=${TEST_SCRIPT:-"src/gpu_accept_cuda_so.py"}
+ENV PARAMS=${PARAMS:-"--quick"}
+
 ENTRYPOINT ["/usr/bin/tini","--"]
-CMD ["python","src/gpu_accept_cuda_so.py","--quick"]
+CMD ["python", "${TEST_SCRIPT}", "${PARAMS}"]
