@@ -41,6 +41,8 @@ Notes
 """
 
 import argparse, math, ctypes  # argparse: CLI flags; math: sizing math; ctypes: FFI bindings to CUDA/NCCL
+import logging, json, datetime  # logging for structured output; json + datetime for saving final report
+import os
 from typing import Callable, Any  # typing helpers for clearer docstrings and signatures
 from ctypes import (c_int, c_size_t, c_void_p, c_float, c_longlong,
                     POINTER, byref, c_char_p)  # low-level C types used across the bindings
@@ -94,6 +96,14 @@ def check_cuda(st, where=""):
     if st != 0:
         msg = cudaGetErrorString(st)
         raise RuntimeError(f"CUDA error {int(st)} at {where}: {(msg or b'').decode()}")
+
+# simple logger setup (console)
+logger = logging.getLogger("gpu_accept")
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(_h)
 
 # allocate page-locked ("pinned") host memory for faster H2D/D2H copies
 cudaHostAlloc          = libcudart.cudaHostAlloc;         cudaHostAlloc.argtypes         = [POINTER(c_void_p), c_size_t, ctypes.c_uint];    cudaHostAlloc.restype  = c_int
@@ -197,15 +207,19 @@ def event_timer(stream: c_void_p | None = None) -> tuple[Callable[[Callable[[], 
     check_cuda(cudaEventCreate(byref(end)),   "evt create end")
     s = stream or c_void_p(0)
     def measure(fn):
+        logger.debug("event_timer: record start")
         # events on the same stream where the work is happening
         check_cuda(cudaEventRecord(start, s))
         fn()
+        logger.debug("event_timer: record end")
         check_cuda(cudaEventRecord(end, s))
         check_cuda(cudaEventSynchronize(end))
         ms = c_float()
         check_cuda(cudaEventElapsedTime(byref(ms), start, end))
-        return ms.value / 1000.0
-    return measure, lambda: (cudaEventDestroy(start), cudaEventDestroy(end))
+        sec = ms.value / 1000.0
+        logger.debug(f"event_timer: elapsed={sec:.6f}s")
+        return sec
+    return measure, lambda: (logger.debug("event_timer: destroy events"), cudaEventDestroy(start), cudaEventDestroy(end))
 
 
 # -------- tests --------
@@ -230,8 +244,10 @@ def pick_gemm_size(free_bytes: int, quick: bool) -> int:
     # memory for A,B,C ~= 12*r^2 bytes (float32)
     budget = int(free_bytes * (0.50 if not quick else 0.20))  # 50% (full) / 20% (quick) of free memory
     r = int(math.sqrt(budget / 12.0))
+    pre = r
     # clamp to sensible ceilings
     r = max(1024 if quick else 2048, min(r, 8192 if quick else 12288))
+    logger.debug(f"pick_gemm_size: free={free_bytes} budget={budget} r_raw={pre} r_clamped={r} quick={quick}")
     return r
 
 
@@ -256,6 +272,7 @@ def gemm_peak(handle: c_void_p, r: int, iters: int) -> dict:
     """
     # allocate
     bytesA = r*r*4; bytesB = r*r*4; bytesC = r*r*4
+    logger.debug(f"gemm_peak: alloc sizes A={bytesA} B={bytesB} C={bytesC}")
     dA = c_void_p(); dB = c_void_p(); dC = c_void_p()
     check_cuda(cudaMalloc(byref(dA), bytesA), "malloc A")
     check_cuda(cudaMalloc(byref(dB), bytesB), "malloc B")
@@ -271,22 +288,26 @@ def gemm_peak(handle: c_void_p, r: int, iters: int) -> dict:
     alpha = c_float(1.0); beta = c_float(0.0)
 
     # warmup
+    logger.debug("gemm_peak: warmup start")
     for _ in range(2):
         ret = cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, r, r, r,
                           byref(alpha), dA, r, dB, r, byref(beta), dC, r)
         assert ret == 0
     check_cuda(cudaDeviceSynchronize(), "warmup sync")
+    logger.debug("gemm_peak: warmup done")
 
     measure, cleanup_evt = event_timer()
     times = []
-    for _ in range(iters):
+    for i in range(iters):
         t = measure(lambda: cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, r, r, r,
                                         byref(alpha), dA, r, dB, r, byref(beta), dC, r))
+        logger.debug(f"gemm_peak: iter={i} t={t:.6f}s")
         times.append(t)
     cleanup_evt()
 
     check_cuda(cudaDeviceSynchronize(), "post runs")
     tflops_each = [(2.0*r*r*r)/t/1e12 for t in times]
+    logger.debug(f"gemm_peak: tflops_each={tflops_each}")
     res = {
         "r": r,
         "iters": iters,
@@ -296,6 +317,7 @@ def gemm_peak(handle: c_void_p, r: int, iters: int) -> dict:
     }
 
     # free
+    logger.debug("gemm_peak: free buffers")
     cudaFree(dA); cudaFree(dB); cudaFree(dC)
     return res
 
@@ -330,6 +352,7 @@ def gemm_batched(handle: c_void_p, r: int, batch: int, iters: int) -> dict:
     totalA = bytes_per_mat * batch
     totalB = totalA
     totalC = totalA
+    logger.debug(f"gemm_batched: r={r} batch={batch} bytes/mat={bytes_per_mat} stride={stride} totals={totalA}")
     dA = c_void_p(); dB = c_void_p(); dC = c_void_p()
     check_cuda(cudaMalloc(byref(dA), totalA), "malloc Ab")
     check_cuda(cudaMalloc(byref(dB), totalB), "malloc Bb")
@@ -343,6 +366,7 @@ def gemm_batched(handle: c_void_p, r: int, batch: int, iters: int) -> dict:
     alpha = c_float(1.0); beta = c_float(0.0)
 
     # warmup
+    logger.debug("gemm_batched: warmup start")
     cublasSgemmStridedBatched(handle, CUBLAS_OP_N, CUBLAS_OP_N,
                               r, r, r,
                               byref(alpha),
@@ -352,10 +376,11 @@ def gemm_batched(handle: c_void_p, r: int, batch: int, iters: int) -> dict:
                               dC, r, c_longlong(stride),
                               c_int(batch))
     check_cuda(cudaDeviceSynchronize(), "warmup batched")
+    logger.debug("gemm_batched: warmup done")
 
     measure, cleanup_evt = event_timer()
     times = []
-    for _ in range(iters):
+    for i in range(iters):
         t = measure(lambda: cublasSgemmStridedBatched(handle, CUBLAS_OP_N, CUBLAS_OP_N,
                                                       r, r, r,
                                                       byref(alpha),
@@ -364,6 +389,7 @@ def gemm_batched(handle: c_void_p, r: int, batch: int, iters: int) -> dict:
                                                       byref(beta),
                                                       dC, r, c_longlong(stride),
                                                       c_int(batch)))
+        logger.debug(f"gemm_batched: iter={i} t={t:.6f}s")
         times.append(t)
     cleanup_evt()
     check_cuda(cudaDeviceSynchronize(), "post batched")
@@ -402,6 +428,7 @@ def bandwidth_test(kind: str, total_bytes: int, reps: int = 10) -> dict:
     # single stream for measurement
     s = c_void_p()
     check_cuda(cudaStreamCreate(byref(s)), "bw stream")
+    logger.debug(f"bandwidth_test: kind={kind} total_bytes={total_bytes} reps={reps}")
 
     # pinned host (for H2D/D2H)
     hptr = c_void_p()
@@ -426,11 +453,13 @@ def bandwidth_test(kind: str, total_bytes: int, reps: int = 10) -> dict:
     # warmup
     do_copy()
     check_cuda(cudaStreamSynchronize(s), "bw warmup")
+    logger.debug("bandwidth_test: warmup done")
 
     measure, cleanup_evt = event_timer(s)
     times = []
-    for _ in range(reps):
+    for i in range(reps):
         t = measure(do_copy)
+        logger.debug(f"bandwidth_test: iter={i} t={t:.6f}s")
         times.append(t)
     cleanup_evt()
     check_cuda(cudaStreamSynchronize(s), "bw post")
@@ -473,6 +502,7 @@ def nccl_allreduce(world: int, elems: int, iters: int = 20) -> dict:
         Summary with average time and a coarse GB/s ring estimate.
     """
     uid = ncclUniqueId(); assert ncclGetUniqueId(byref(uid)) == 0
+    logger.debug(f"nccl_allreduce: world={world} elems={elems} iters={iters}")
     comms   = [c_void_p() for _ in range(world)]
     streams = [c_void_p() for _ in range(world)]
     bufs    = [c_void_p() for _ in range(world)]
@@ -487,6 +517,7 @@ def nccl_allreduce(world: int, elems: int, iters: int = 20) -> dict:
         host = (c_float * elems)(*([1.0]*elems))
         check_cuda(cudaMemcpy(bufs[r], ctypes.addressof(host), elems*4, cudaMemcpyHostToDevice), f"H2D {r}")
         assert ncclCommInitRank(byref(comms[r]), world, uid, r) == 0
+        logger.debug(f"nccl_allreduce: rank {r} ready")
 
     # warmup
     ncclGroupStart()
@@ -495,17 +526,19 @@ def nccl_allreduce(world: int, elems: int, iters: int = 20) -> dict:
     ncclGroupEnd()
     for r in range(world):
         check_cuda(cudaSetDevice(r)); check_cuda(cudaStreamSynchronize(streams[r]))
+    logger.debug("nccl_allreduce: warmup done")
 
     # measure
     measure, cleanup_evt = event_timer()  # simple "around group call"
     times = []
-    for _ in range(iters):
+    for i in range(iters):
         t = measure(lambda: (
             ncclGroupStart(),
             [ncclAllReduce(bufs[r], bufs[r], elems, ncclFloat32, ncclSum, comms[r], streams[r]) for r in range(world)],
             ncclGroupEnd(),
             [cudaStreamSynchronize(streams[r]) for r in range(world)]
         ))
+        logger.debug(f"nccl_allreduce: iter={i} t={t:.6f}s")
         times.append(t)
     cleanup_evt()
 
@@ -514,6 +547,7 @@ def nccl_allreduce(world: int, elems: int, iters: int = 20) -> dict:
         ncclCommDestroy(comms[r])
         cudaFree(bufs[r])
         cudaStreamDestroy(streams[r])
+    logger.debug("nccl_allreduce: cleanup done")
 
     avg_t = sum(times)/len(times)
     bytes_per_gpu = elems*4
@@ -536,13 +570,21 @@ def main():
     --quick : reduce matrix sizes, buffer sizes and iteration counts to finish fast.
     """
     ap = argparse.ArgumentParser()
-    ap.add_argument("--quick", action="store_true")
+    ap.add_argument("--quick", action="store_true", required=False)
+    ap.add_argument("--log-level", default="INFO", choices=["DEBUG","INFO","WARNING","ERROR","CRITICAL"], required=False)
+    ap.add_argument("--report-dir", default="", required=False)
+    ap.add_argument("--report-name", default="gpu_accept_report.json", required=False)
     args = ap.parse_args()
 
     # devices
     ndev = c_int()
     check_cuda(cudaGetDeviceCount(byref(ndev)), "getDeviceCount")
-    print(f"[ENV] GPUs: {ndev.value}")
+    try:
+        logger.setLevel(getattr(logging, args.log_level.upper()))
+    except Exception:
+        pass
+    logger.debug(f"args: quick={args.quick} log_level={args.log_level}")
+    logger.info(f"[ENV] GPUs: {ndev.value}")
     assert ndev.value >= 1, "No GPUs visible"
 
     # memory info (GPU0)
@@ -550,24 +592,37 @@ def main():
     check_cuda(cudaSetDevice(0)); check_cuda(cudaMemGetInfo(byref(free_b), byref(total_b)), "meminfo")
     # cuBLAS handle
     handle = c_void_p(); assert cublasCreate(byref(handle)) == 0
+    report = {
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "quick": bool(args.quick),
+        "env": {
+            "gpus": int(ndev.value),
+            "free_bytes": int(free_b.value),
+            "total_bytes": int(total_b.value),
+        },
+        "tests": {}
+    }
 
     # --- SGEMM peak ---
     r = pick_gemm_size(free_b.value, quick=args.quick)
     iters = 6 if args.quick else 16
     g = gemm_peak(handle, r, iters)
-    print(f"[COMPUTE/SGEMM] r={g['r']} iters={g['iters']}  avg={g['avg_tflops']} TF/s  best={g['best_tflops']} TF/s  avg_t={g['avg_time_s']} s")
+    report["tests"]["sgemm"] = g
+    logger.info(f"[COMPUTE/SGEMM] r={g['r']} iters={g['iters']}  avg={g['avg_tflops']} TF/s  best={g['best_tflops']} TF/s  avg_t={g['avg_time_s']} s")
 
-    # --- Batched GEMM (если поддерживается) ---
+    # --- Batched GEMM (if supported) ---
     if HAS_STRIDED_BATCHED:
         batch = 16 if args.quick else 64
         ib = 4 if args.quick else 12
         gb = gemm_batched(handle, min(1024, r//2), batch, ib)
+        report["tests"]["batched_gemm"] = gb
         if gb.get("supported"):
-            print(f"[COMPUTE/BATCHED] r={gb['r']} batch={gb['batch']} iters={gb['iters']}  avg={gb['avg_tflops']} TF/s  best={gb['best_tflops']} TF/s")
+            logger.info(f"[COMPUTE/BATCHED] r={gb['r']} batch={gb['batch']} iters={gb['iters']}  avg={gb['avg_tflops']} TF/s  best={gb['best_tflops']} TF/s")
         else:
-            print("[COMPUTE/BATCHED] not supported (symbol not found)")
+            logger.info("[COMPUTE/BATCHED] not supported (symbol not found)")
     else:
-        print("[COMPUTE/BATCHED] not supported (symbol not found)")
+        report["tests"]["batched_gemm"] = {"supported": False}
+        logger.info("[COMPUTE/BATCHED] not supported (symbol not found)")
 
     # destroy handle
     cublasDestroy(handle)
@@ -579,11 +634,13 @@ def main():
     sz = min(max_for_bw, target*4)  # cap at 4GB in full mode
     sz = max((256<<20), sz)  # minimum 256MB
     reps = 6 if args.quick else 12
+    report["tests"]["bandwidth"] = {}
     for kind in ("H2D","D2H","D2D"):
         bw = bandwidth_test(kind, sz, reps=reps)
-        print(f"[BW/{kind}] size={bw['size_gb']} GB reps={bw['reps']}  avg={bw['avg_gbps']} GB/s  best={bw['best_gbps']} GB/s")
+        report["tests"]["bandwidth"][kind] = bw
+        logger.info(f"[BW/{kind}] size={bw['size_gb']} GB reps={bw['reps']}  avg={bw['avg_gbps']} GB/s  best={bw['best_gbps']} GB/s")
 
-    # --- NCCL all-reduce (если >=2 GPU) ---
+    # --- NCCL all-reduce (if >=2 GPU) ---
     if ndev.value >= 2:
         # take buffer ~256MB (quick) / 1GB (full), but <= 15% of free memory
         max_nccl = int(free_b.value * (0.15 if not args.quick else 0.08))
@@ -592,11 +649,26 @@ def main():
         elems = bsz//4
         it_nccl = 12 if args.quick else 24
         n = nccl_allreduce(ndev.value, elems, iters=it_nccl)
-        print(f"[NCCL/AR] elems={n['elems']} bytes/gpu={n['bytes_per_gpu']} iters={n['iters']} avg_t={n['avg_time_s']} s  eff_ring≈{n['eff_ring_gbps_est']} GB/s")
+        report["tests"]["nccl_allreduce"] = n
+        logger.info(f"[NCCL/AR] elems={n['elems']} bytes/gpu={n['bytes_per_gpu']} iters={n['iters']} avg_t={n['avg_time_s']} s  eff_ring≈{n['eff_ring_gbps_est']} GB/s")
     else:
-        print("[NCCL] skipped (need >=2 GPUs)")
+        report["tests"]["nccl_allreduce"] = {"skipped": True, "reason": "need >=2 GPUs"}
+        logger.info("[NCCL] skipped (need >=2 GPUs)")
 
-    print("[RESULT] SUCCESS")
+    report_dir = args.report_dir
+    report_name = args.report_name
+    out_path = os.path.join(report_dir, report_name) if report_dir else report_name
+    if report_dir:
+        try:
+            os.makedirs(report_dir, exist_ok=True)
+        except Exception as e:
+            logger.error(f"[RESULT] FAILED TO CREATE REPORT DIR: {e}")
+    try:
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2)
+        logger.info(f"[RESULT] SUCCESS - report saved to {out_path}")
+    except Exception as e:
+        logger.error(f"[RESULT] FAILED TO SAVE REPORT: {e}")
 
 if __name__ == "__main__":
     main()
