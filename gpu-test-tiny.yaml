@@ -1,0 +1,28 @@
+# gpu-test-tiny.yaml for k8s cluster
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-acceptance
+spec:
+  restartPolicy: Never
+  containers:
+  - name: runner
+    image: ghcr.io/jamessyjay/gpu-cluster-acceptance:tiny
+    args: ["python","/app/src/gpu_accept_cuda_so.py","--quick"]
+    resources:
+      limits:
+        # limit to 2 GPUs but could be increased
+        nvidia.com/gpu: 2
+    securityContext:
+      allowPrivilegeEscalation: false
+    volumeMounts:
+    - name: dshm
+      mountPath: /dev/shm
+  volumes:
+  - name: dshm
+    emptyDir:
+      medium: Memory
+
+volumes:
+  - name: dshm
+    emptyDir: { medium: Memory }
