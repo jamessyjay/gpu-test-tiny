@@ -34,13 +34,23 @@ jobs:
           push: true
           tags: ghcr.io/${{ github.repository }}:tiny
 
+      - name: Detect NVIDIA runtime on runner
+        id: gpu_check
+        run: |
+          echo "Checking for NVIDIA runtime in Docker..."
+          if docker info --format '{{json .Runtimes}}' | grep -qi nvidia; then
+            echo "has_gpu=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_gpu=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Run GPU Test
-        if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.base.ref == github.ref) && contains(runner.labels, 'gpu') }}
+        if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.base.ref == github.ref) && steps.gpu_check.outputs.has_gpu == 'true' }}
         run: |
           echo "Run GPU Test"
           docker run --gpus all ghcr.io/${{ github.repository }}:tiny python /app/src/gpu_accept_cuda_so.py
 
-      - name: Skip GPU Test (no GPU on runner)
-        if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.base.ref == github.ref) && !contains(runner.labels, 'gpu') }}
+      - name: Skip GPU Test (no NVIDIA runtime on runner)
+        if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.base.ref == github.ref) && steps.gpu_check.outputs.has_gpu != 'true' }}
         run: |
-          echo "Skipping GPU Test: no GPU available on this runner. Build succeeded."
+          echo "Skipping GPU Test: no NVIDIA runtime available on this runner. Build succeeded."

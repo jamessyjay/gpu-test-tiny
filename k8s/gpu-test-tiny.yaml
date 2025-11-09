@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+# Why DaemonSet - to guarantee each pod run on each node with GPU
+kind: DaemonSet
+metadata:
+  name: gpu-acceptance-ds
+spec:
+  selector:
+    matchLabels:
+      app: gpu-acceptance
+  template:
+    metadata:
+      labels:
+        app: gpu-acceptance
+    spec:
+      restartPolicy: OnFailure
+      nodeSelector:
+        nvidia.com/gpu.present: "true"   # adjust to your node labels
+      tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "NoSchedule"
+      containers:
+      - name: runner
+        image: ghcr.io/jamessyjay/gpu-cluster-acceptance:tiny
+        imagePullPolicy: IfNotPresent
+        # shell for env variable substitution
+        command: ["/bin/sh","-lc"]
+        args:
+          - >
+            python /app/src/gpu_accept_cuda_so.py
+            --log-level ${LOG_LEVEL}
+            --report-dir ${REPORT_DIR}
+            --report-name gpu_accept_${NODE_NAME}.json
+        env:
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: REPORT_DIR
+          value: "/reports"
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: NCCL_IB_DISABLE
+          value: "0"  # 0 - IB enabled (not disabled); 1 - IB disabled
+        - name: NCCL_DEBUG
+          value: "INFO"
+        # specify HCA/interfases if needed:
+        # - name: NCCL_SOCKET_IFNAME
+        #   value: "eth0"
+        # - name: NCCL_IB_HCA
+        #   value: "mlx5_0,mlx5_1"
+        resources:
+          requests:
+            # requests 1 GPU per pod/node
+            nvidia.com/gpu: 1
+          limits:
+            # limits 1 GPU per pod/node (could be increased)
+            nvidia.com/gpu: 1
+        securityContext:
+          allowPrivilegeEscalation: false
+        volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
+        - name: reports
+          mountPath: /reports
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+      - name: reports
+        hostPath:
+          path: /var/log/gpu-acceptance   # adjust to your node labels (e.g. /var/log/gpu-acceptance)
+          type: DirectoryOrCreate
