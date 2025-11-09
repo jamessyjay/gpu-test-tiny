@@ -35,7 +35,12 @@ jobs:
           tags: ghcr.io/${{ github.repository }}:tiny
 
       - name: Run GPU Test
-        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.base.ref == github.ref }}
+        if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.base.ref == github.ref) && contains(runner.labels, 'gpu') }}
         run: |
           echo "Run GPU Test"
           docker run --gpus all ghcr.io/${{ github.repository }}:tiny python /app/src/gpu_accept_cuda_so.py
+
+      - name: Skip GPU Test (no GPU on runner)
+        if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.base.ref == github.ref) && !contains(runner.labels, 'gpu') }}
+        run: |
+          echo "Skipping GPU Test: no GPU available on this runner. Build succeeded."
