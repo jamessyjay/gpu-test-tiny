@@ -154,6 +154,8 @@ cublasDestroy  = libcublas.cublasDestroy_v2;  cublasDestroy.argtypes  = [c_void_
 cublasSgemm    = libcublas.cublasSgemm_v2;    cublasSgemm.restype     = c_int
 # optional (if present) batched sgemm
 try:
+    # cublasSgemmStridedBatched is available in CUDA 11.2+
+    # calls cublasSgemmStridedBatched if available, otherwise cublasSgemm
     cublasSgemmStridedBatched = libcublas.cublasSgemmStridedBatched
     cublasSgemmStridedBatched.restype = c_int
     HAS_STRIDED_BATCHED = True
@@ -251,24 +253,25 @@ def pick_gemm_size(free_bytes: int, quick: bool) -> int:
     return r
 
 
-def gemm_peak(handle: c_void_p, r: int, iters: int) -> dict:
-    """Run peak SGEMM on a single GPU and estimate TFLOPs.
+def _gemm_peak_alloc_init(r: int) -> tuple[c_void_p, c_void_p, c_void_p, c_float, c_float]:
+    """Allocate SGEMM device buffers and initialize.
+
+    Purpose
+    -------
+    Allocates three r×r float32 device buffers for SGEMM (A, B, C), initializes
+    A and B with zeros via host-to-device copies, and prepares scalar factors
+    `alpha` and `beta` for use in GEMM calls.
 
     Parameters
     ----------
-    handle : c_void_p
-        cuBLAS handle (v2).
     r : int
-        Matrix dimension (square) for A, B, C.
-    iters : int
-        Number of timed iterations (warm-up is done internally).
-    stream : c_void_p or None
-        Optional CUDA stream if associating cuBLAS handle externally.
+        Matrix dimension for square matrices A, B, C (float32 elements).
 
     Returns
     -------
-    dict
-        Summary with r, iters, avg/best TFLOPs and average wall time.
+    (dA, dB, dC, alpha, beta) : tuple
+        - dA, dB, dC: c_void_p device pointers to the allocated matrices
+        - alpha, beta: c_float scalars used by SGEMM
     """
     # allocate
     bytesA = r*r*4; bytesB = r*r*4; bytesC = r*r*4
@@ -286,7 +289,23 @@ def gemm_peak(handle: c_void_p, r: int, iters: int) -> dict:
 
     # (optional) associate stream? cublasSgemm v2 uses handle's stream via cublasSetStream; we skip it — default.
     alpha = c_float(1.0); beta = c_float(0.0)
+    return dA, dB, dC, alpha, beta
 
+
+def _gemm_peak_warmup(handle: c_void_p, r: int, dA: c_void_p, dB: c_void_p, dC: c_void_p, alpha: c_float, beta: c_float) -> None:
+    """Run short warm-up SGEMM passes and synchronize device.
+
+    Parameters
+    ----------
+    handle : c_void_p
+        cuBLAS v2 handle.
+    r : int
+        Matrix dimension.
+    dA, dB, dC : c_void_p
+        Device buffers for A, B, C.
+    alpha, beta : c_float
+        SGEMM scalar coefficients.
+    """
     # warmup
     logger.debug("gemm_peak: warmup start")
     for _ in range(2):
@@ -296,16 +315,63 @@ def gemm_peak(handle: c_void_p, r: int, iters: int) -> dict:
     check_cuda(cudaDeviceSynchronize(), "warmup sync")
     logger.debug("gemm_peak: warmup done")
 
+
+def _gemm_peak_measure(handle: c_void_p, r: int, dA: c_void_p, dB: c_void_p, dC: c_void_p, alpha: c_float, beta: c_float, iters: int) -> list[float]:
+    """Measure SGEMM wall-times with CUDA events.
+
+    Parameters
+    ----------
+    handle : c_void_p
+        cuBLAS v2 handle.
+    r : int
+        Matrix dimension.
+    dA, dB, dC : c_void_p
+        Device buffers for A, B, C.
+    alpha, beta : c_float
+        SGEMM scalar coefficients.
+    iters : int
+        Number of timed repetitions.
+
+    Returns
+    -------
+    list[float]
+        Per-iteration timings in seconds.
+    """
     measure, cleanup_evt = event_timer()
-    times = []
+    times: list[float] = []
     for i in range(iters):
         t = measure(lambda: cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, r, r, r,
                                         byref(alpha), dA, r, dB, r, byref(beta), dC, r))
         logger.debug(f"gemm_peak: iter={i} t={t:.6f}s")
         times.append(t)
     cleanup_evt()
-
     check_cuda(cudaDeviceSynchronize(), "post runs")
+    return times
+
+
+def _gemm_peak_finalize(dA: c_void_p, dB: c_void_p, dC: c_void_p) -> None:
+    """Free SGEMM device buffers.
+
+    Parameters
+    ----------
+    dA, dB, dC : c_void_p
+        Device pointers to be released.
+    """
+    # free
+    logger.debug("gemm_peak: free buffers")
+    cudaFree(dA); cudaFree(dB); cudaFree(dC)
+
+
+def gemm_peak(handle: c_void_p, r: int, iters: int) -> dict:
+    """Run peak SGEMM on a single GPU and estimate TFLOPs."""
+    # dA, dB, dC - device SGEMM (float32) buffers for A, B, C
+    # alpha, beta - scalars for SGEMM
+    # r - matrix dimension
+    dA, dB, dC, alpha, beta = _gemm_peak_alloc_init(r)
+    _gemm_peak_warmup(handle, r, dA, dB, dC, alpha, beta)
+    # times - list of times for each iteration
+    times = _gemm_peak_measure(handle, r, dA, dB, dC, alpha, beta, iters)
+    # tflops_each - list of TFLOPs for each iteration
     tflops_each = [(2.0*r*r*r)/t/1e12 for t in times]
     logger.debug(f"gemm_peak: tflops_each={tflops_each}")
     res = {
@@ -315,10 +381,7 @@ def gemm_peak(handle: c_void_p, r: int, iters: int) -> dict:
         "best_tflops": round(max(tflops_each), 2),
         "avg_time_s": round(sum(times)/len(times), 4),
     }
-
-    # free
-    logger.debug("gemm_peak: free buffers")
-    cudaFree(dA); cudaFree(dB); cudaFree(dC)
+    _gemm_peak_finalize(dA, dB, dC)
     return res
 
 
@@ -408,27 +471,34 @@ def gemm_batched(handle: c_void_p, r: int, batch: int, iters: int) -> dict:
     return res
 
 
-def bandwidth_test(kind: str, total_bytes: int, reps: int = 10) -> dict:
-    """Measure memcpy bandwidth for H2D/D2H/D2D using a single CUDA stream.
+def _bw_setup(kind: str, total_bytes: int) -> tuple[c_void_p, c_void_p, c_void_p, c_void_p | None]:
+    """Prepare resources for bandwidth test.
+
+    Purpose
+    -------
+    Creates a CUDA stream, allocates a pinned host buffer when required
+    (for H2D/D2H), and allocates one or two device buffers depending on the
+    copy direction.
 
     Parameters
     ----------
     kind : {"H2D","D2H","D2D"}
-        Copy direction.
+        Copy direction under test.
     total_bytes : int
         Transfer size in bytes.
-    reps : int
-        Number of timed repetitions (one warm-up is done internally).
 
     Returns
     -------
-    dict
-        Summary with average and best GB/s and the tested size.
+    (s, hptr, d0, d1) : tuple
+        - s: CUDA stream handle (c_void_p)
+        - hptr: pinned host pointer (c_void_p; null when not needed)
+        - d0: first device buffer (c_void_p)
+        - d1: second device buffer for D2D, otherwise None
     """
     # single stream for measurement
     s = c_void_p()
     check_cuda(cudaStreamCreate(byref(s)), "bw stream")
-    logger.debug(f"bandwidth_test: kind={kind} total_bytes={total_bytes} reps={reps}")
+    logger.debug(f"bandwidth_test: kind={kind} total_bytes={total_bytes}")
 
     # pinned host (for H2D/D2H)
     hptr = c_void_p()
@@ -440,7 +510,29 @@ def bandwidth_test(kind: str, total_bytes: int, reps: int = 10) -> dict:
     check_cuda(cudaMalloc(byref(d0), total_bytes), "malloc d0")
     if kind == "D2D":
         check_cuda(cudaMalloc(byref(d1), total_bytes), "malloc d1")
+    else:
+        d1 = None
+    return s, hptr, d0, d1
 
+
+def _bw_warmup(kind: str, s: c_void_p, hptr: c_void_p, d0: c_void_p, d1: c_void_p | None, total_bytes: int) -> None:
+    """Execute one warm-up copy for the configured direction and sync stream.
+
+    Parameters
+    ----------
+    kind : {"H2D","D2H","D2D"}
+        Copy direction.
+    s : c_void_p
+        CUDA stream handle.
+    hptr : c_void_p
+        Pinned host pointer (unused for D2D).
+    d0 : c_void_p
+        Source/target device pointer.
+    d1 : c_void_p or None
+        Second device pointer for D2D.
+    total_bytes : int
+        Transfer size in bytes.
+    """
     # helper to run copy
     def do_copy():
         if kind == "H2D":
@@ -449,21 +541,85 @@ def bandwidth_test(kind: str, total_bytes: int, reps: int = 10) -> dict:
             check_cuda(cudaMemcpyAsync(hptr, d0, total_bytes, cudaMemcpyDeviceToHost, s))
         else:  # D2D
             check_cuda(cudaMemcpyAsync(d1, d0, total_bytes, cudaMemcpyDeviceToDevice, s))
-
     # warmup
     do_copy()
     check_cuda(cudaStreamSynchronize(s), "bw warmup")
     logger.debug("bandwidth_test: warmup done")
 
+
+def _bw_measure(kind: str, s: c_void_p, hptr: c_void_p, d0: c_void_p, d1: c_void_p | None, total_bytes: int, reps: int) -> list[float]:
+    """Measure memcpy latency across multiple repetitions.
+
+    Parameters
+    ----------
+    kind : {"H2D","D2H","D2D"}
+        Copy direction.
+    s : c_void_p
+        CUDA stream handle.
+    hptr : c_void_p
+        Pinned host pointer (unused for D2D).
+    d0 : c_void_p
+        Source/target device pointer.
+    d1 : c_void_p or None
+        Second device pointer for D2D.
+    total_bytes : int
+        Transfer size in bytes.
+    reps : int
+        Number of timed repetitions.
+
+    Returns
+    -------
+    list[float]
+        Per-iteration timings in seconds.
+    """
+    def do_copy():
+        if kind == "H2D":
+            check_cuda(cudaMemcpyAsync(d0, hptr, total_bytes, cudaMemcpyHostToDevice, s))
+        elif kind == "D2H":
+            check_cuda(cudaMemcpyAsync(hptr, d0, total_bytes, cudaMemcpyDeviceToHost, s))
+        else:
+            check_cuda(cudaMemcpyAsync(d1, d0, total_bytes, cudaMemcpyDeviceToDevice, s))
     measure, cleanup_evt = event_timer(s)
-    times = []
+    times: list[float] = []
     for i in range(reps):
         t = measure(do_copy)
         logger.debug(f"bandwidth_test: iter={i} t={t:.6f}s")
         times.append(t)
     cleanup_evt()
     check_cuda(cudaStreamSynchronize(s), "bw post")
+    return times
 
+
+def _bw_cleanup(kind: str, s: c_void_p, hptr: c_void_p, d0: c_void_p, d1: c_void_p | None) -> None:
+    """Release resources used by the bandwidth test.
+
+    Parameters
+    ----------
+    kind : {"H2D","D2H","D2D"}
+        Copy direction.
+    s : c_void_p
+        CUDA stream handle to destroy.
+    hptr : c_void_p
+        Pinned host pointer to free (if allocated).
+    d0 : c_void_p
+        First device pointer to free.
+    d1 : c_void_p or None
+        Second device pointer to free (D2D only).
+    """
+    # free
+    if kind in ("H2D", "D2H"):
+        cudaFreeHost(hptr)
+    if kind == "D2D" and d1 is not None:
+        cudaFree(d1)
+    cudaFree(d0)
+    cudaStreamDestroy(s)
+
+
+def bandwidth_test(kind: str, total_bytes: int, reps: int = 10) -> dict:
+    """Measure memcpy bandwidth for H2D/D2H/D2D using a single CUDA stream."""
+    s, hptr, d0, d1 = _bw_setup(kind, total_bytes)
+    _bw_warmup(kind, s, hptr, d0, d1, total_bytes)
+    times = _bw_measure(kind, s, hptr, d0, d1, total_bytes, reps)
     gb = total_bytes / 1e9
     bw = [ gb/t for t in times ]
     res = {
@@ -473,14 +629,7 @@ def bandwidth_test(kind: str, total_bytes: int, reps: int = 10) -> dict:
         "avg_gbps": round(sum(bw)/len(bw), 2),
         "best_gbps": round(max(bw), 2)
     }
-
-    # free
-    if kind in ("H2D", "D2H"):
-        cudaFreeHost(hptr)
-    if kind == "D2D":
-        cudaFree(d1)
-    cudaFree(d0)
-    cudaStreamDestroy(s)
+    _bw_cleanup(kind, s, hptr, d0, d1)
     return res
 
 
