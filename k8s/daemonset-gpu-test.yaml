@@ -13,12 +13,6 @@ spec:
         app: gpu-acceptance
     spec:
       restartPolicy: Always
-      nodeSelector:
-        nvidia.com/gpu.present: "true"   # adjust to your node labels
-      tolerations:
-      - key: "nvidia.com/gpu"
-        operator: "Exists"
-        effect: "NoSchedule"
       containers:
       - name: runner
         image: ghcr.io/jamessyjay/gpu-cluster-acceptance:tiny
