@@ -12,7 +12,7 @@ spec:
       labels:
         app: gpu-acceptance
     spec:
-      restartPolicy: OnFailure
+      restartPolicy: Always
       nodeSelector:
         nvidia.com/gpu.present: "true"   # adjust to your node labels
       tolerations:
