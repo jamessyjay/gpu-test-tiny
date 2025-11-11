@@ -22,11 +22,11 @@ spec:
       containers:
       - name: runner
         image: ghcr.io/jamessyjay/gpu-cluster-acceptance:tiny
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: Always
         # shell for env variable substitution
         command: ["/bin/sh","-lc"]
         args:
-          - >
+          - |
             python /app/src/gpu_accept_cuda_so.py
             --log-level ${LOG_LEVEL}
             --report-dir ${REPORT_DIR}
@@ -41,14 +41,14 @@ spec:
             fieldRef:
               fieldPath: spec.nodeName
         - name: NCCL_IB_DISABLE
-          value: "0"  # 0 - IB enabled (not disabled); 1 - IB disabled
+          value: "1"  # 0 - IB enabled (not disabled); 1 - IB disabled
         - name: NCCL_DEBUG
           value: "INFO"
         # specify HCA/interfases if needed:
-        # - name: NCCL_SOCKET_IFNAME
-        #   value: "eth0"
-        # - name: NCCL_IB_HCA
-        #   value: "mlx5_0,mlx5_1"
+        - name: NCCL_SOCKET_IFNAME
+          value: "eth0"
+        #- name: NCCL_IB_HCA
+        #  value: "mlx5_0,mlx5_1"
         resources:
           requests:
             # requests 1 GPU per pod/node
