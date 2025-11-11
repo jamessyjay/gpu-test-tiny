@@ -21,10 +21,10 @@ spec:
         command: ["/bin/sh","-lc"]
         args:
           - |
-            python /app/src/gpu_accept_cuda_so.py
-            --log-level ${LOG_LEVEL}
-            --report-dir ${REPORT_DIR}
-            --report-name gpu_accept_${NODE_NAME}.json
+            python /app/src/gpu_accept_cuda_so.py \
+              --log-level "${LOG_LEVEL}" \
+              --report-dir "${REPORT_DIR}" \
+              --report-name "gpu_accept_${NODE_NAME}.json"
         env:
         - name: LOG_LEVEL
           value: "INFO"
